@@ -25,7 +25,6 @@ os.makedirs(TMP_DIR, exist_ok=True)
 
 
 def _which(names):
-    """Return the first existing path from a list of candidate names/paths."""
     for n in names:
         if not n:
             continue
@@ -61,19 +60,36 @@ log.info("ffmpeg = %s", FFMPEG)
 log.info("node   = %s", NODE)
 log.info("cookies= %s (%d bytes)", COOKIE_FILE, os.path.getsize(COOKIE_FILE) if HAS_COOKIES else 0)
 
+# Player-client list.  yt-dlp defaults to a set that includes the "tv"
+# client which exposes the full height table (144/240/360/480/720/1080/...)
+# but only as separate video+audio streams.  "web" returns a few progressive
+# MP4 streams.  We try the most-capable clients first and fall back through
+# the rest.  "default" tells yt-dlp to use its built-in priority, which is
+# usually what works on Replit/Replit-like IPs.
+CLIENT_CHAIN = [
+    None,                # yt-dlp default (best on Replit)
+    ["tv"],              # TV HTML5 – full set, but no progressive MP4
+    ["web", "mweb"],     # WEB clients – progressive MP4
+    ["ios"],             # iOS – limited
+    ["android"],         # ANDROID – limited
+]
+
+
 # ── YT-DLP BASE OPTIONS ──────────────────────────────────────
-def base_opts(download=False):
+def base_opts(download=False, player_clients=None):
     opts = {
         "quiet":            True,
         "no_warnings":      True,
         "ignoreerrors":     False,
-        "retries":          3,
-        "fragment_retries": 3,
+        "retries":          5,
+        "fragment_retries": 5,
         "socket_timeout":   30,
         "concurrent_fragment_downloads": 4,
         "noplaylist":       True,
         "skip_download":    not download,
         "ffmpeg_location":  FFMPEG,
+        # Always merge any video+audio pair into an MP4 container.
+        "merge_output_format": "mp4",
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -86,10 +102,10 @@ def base_opts(download=False):
             "Sec-Fetch-Site":  "none",
         },
     }
-    # node is REQUIRED to solve YouTube signature/n-challenge on 2026
+    if player_clients:
+        opts["extractor_args"] = {"youtube": {"player_client": player_clients}}
     if NODE:
         opts["js_runtimes"] = {"node": {"path": NODE}}
-        # remote EJS scripts are needed for current n-sig challenges
         opts["remote_components"] = {"ejs": True}
     if HAS_COOKIES:
         opts["cookiefile"] = COOKIE_FILE
@@ -98,6 +114,7 @@ def base_opts(download=False):
 
 # ── HELPERS ──────────────────────────────────────────────────
 URL_RE = re.compile(r"^https?://", re.I)
+
 
 def normalize_url(link):
     link = (link or "").strip()
@@ -113,8 +130,19 @@ def normalize_url(link):
 
 
 def extract_info(url):
-    with yt_dlp.YoutubeDL(base_opts()) as ydl:
-        return ydl.extract_info(url, download=False)
+    """Extract video info.  Tries several player client sets so the request
+    succeeds whether the server is on a Replit IP, a Render IP, with or
+    without cookies."""
+    last = None
+    for clients in CLIENT_CHAIN:
+        try:
+            opts = base_opts(player_clients=clients)
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(url, download=False)
+        except Exception as e:
+            last = e
+            log.warning("extract_info with clients=%s failed: %s", clients, e)
+    raise last or RuntimeError("extract_info failed for all player clients")
 
 
 def format_duration(sec):
@@ -163,13 +191,18 @@ QUALITY_LABELS = {
 
 
 def available_heights(info):
-    """Heights that exist as MP4 streams (H.264 preferred)."""
+    """Heights that exist as video streams (any modern codec).  We use the
+    presence of a video stream as a hint that we can produce a merged MP4 at
+    that height, even if the original stream is webm/av1 – ffmpeg will
+    transcode / remux as needed."""
     seen = set()
     for f in info.get("formats", []) or []:
-        h  = f.get("height")
-        vc = f.get("vcodec") or "none"
-        ext = f.get("ext")
-        if h and vc not in (None, "none") and ext == "mp4":
+        h    = f.get("height")
+        vc   = f.get("vcodec") or "none"
+        ac   = f.get("acodec") or "none"
+        if h and vc not in (None, "none"):
+            # Any video stream (progressive OR video-only) means the height
+            # is achievable.  ffmpeg will merge with audio automatically.
             seen.add(h)
     out = []
     for t in TARGET_HEIGHTS:
@@ -179,11 +212,20 @@ def available_heights(info):
 
 
 def video_format_string(target_h):
-    """Pick best MP4-with-audio at <= target_h. H.264 first, fall back gracefully."""
+    """Format selector that always succeeds and always ends up merged to MP4.
+
+    Order of preference:
+      1. H.264 MP4 video + M4A audio (broad player support)
+      2. Any MP4 video + M4A audio
+      3. Any video + any audio   → ffmpeg merges to MP4
+      4. Single progressive MP4
+      5. Anything → ffmpeg remuxes to MP4
+    """
     return (
         f"bestvideo[height<={target_h}][ext=mp4][vcodec^=avc]+bestaudio[ext=m4a]"
         f"/bestvideo[height<={target_h}][ext=mp4]+bestaudio[ext=m4a]"
         f"/bestvideo[height<={target_h}]+bestaudio"
+        f"/best[height<={target_h}][ext=mp4]"
         f"/best[height<={target_h}]"
         f"/best"
     )
@@ -276,34 +318,46 @@ def audio_download():
     sid = uuid.uuid4().hex
     tpl = os.path.join(TMP_DIR, f"{sid}.%(ext)s")
     mp3 = os.path.join(TMP_DIR, f"{sid}.mp3")
-    try:
-        opts = base_opts(download=True)
-        opts.update({
-            # Lowest-bitrate audio-only stream → tiny MP3
-            "format":          "worstaudio/worst",
-            "outtmpl":         tpl,
-            "postprocessors":  [{
-                "key":              "FFmpegExtractAudio",
-                "preferredcodec":   "mp3",
-                "preferredquality": "64",   # 64 kbps – "low quality"
-            }],
-            "postprocessor_args": ["-vn"],
-        })
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
 
-        if not os.path.exists(mp3):
-            files = [f for f in os.listdir(TMP_DIR) if f.startswith(sid)]
-            if files:
-                mp3 = os.path.join(TMP_DIR, files[0])
-        if not os.path.exists(mp3):
-            return jsonify({"status": "error", "error": "MP3 file not produced"}), 500
+    client_sets = CLIENT_CHAIN
+    last_error  = None
+    for clients in client_sets:
+        try:
+            opts = base_opts(download=True, player_clients=clients)
+            opts.update({
+                # Lowest-bitrate audio-only stream → tiny MP3
+                "format":          "worstaudio/worst",
+                "outtmpl":         tpl,
+                "postprocessors":  [{
+                    "key":              "FFmpegExtractAudio",
+                    "preferredcodec":   "mp3",
+                    "preferredquality": "64",   # 64 kbps – "low quality"
+                }],
+                "postprocessor_args": ["-vn"],
+            })
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
 
-        return serve_and_clean(mp3, f"{safe_title(info, 'audio')}.mp3", "audio/mpeg")
-    except Exception as ex:
-        cleanup_prefix(sid)
-        log.exception("audio_download failed")
-        return jsonify({"status": "error", "error": str(ex)}), 500
+            if not os.path.exists(mp3):
+                files = [f for f in os.listdir(TMP_DIR)
+                         if f.startswith(sid) and f.endswith(".mp3")]
+                if files:
+                    mp3 = os.path.join(TMP_DIR, files[0])
+            if os.path.exists(mp3):
+                return serve_and_clean(mp3,
+                                        f"{safe_title(info, 'audio')}.mp3",
+                                        "audio/mpeg")
+            last_error = RuntimeError("MP3 file not produced")
+        except Exception as ex:
+            last_error = ex
+            cleanup_prefix(sid)
+            log.warning("audio attempt clients=%s failed: %s", clients, ex)
+            continue
+
+    cleanup_prefix(sid)
+    log.exception("audio_download failed")
+    return jsonify({"status": "error",
+                    "error": str(last_error) if last_error else "audio failed"}), 500
 
 
 # ── VIDEO INFO (JSON, lists available MP4 qualities) ───
@@ -318,7 +372,6 @@ def video(link=None):
 
     # ── DOWNLOAD MODE ──────────────────────────────────
     if height:
-        # allow "best" / numeric
         if height.isdigit():
             target_h = int(height)
         elif height.lower() == "best":
@@ -329,40 +382,69 @@ def video(link=None):
         sid = uuid.uuid4().hex
         tpl = os.path.join(TMP_DIR, f"{sid}.%(ext)s")
         mp4 = os.path.join(TMP_DIR, f"{sid}.mp4")
-        try:
-            opts = base_opts(download=True)
-            opts.update({
-                "format":             video_format_string(target_h),
-                "outtmpl":            tpl,
-                "merge_output_format": "mp4",
-                "postprocessor_args": {
-                    "ffmpeg_o": ["-movflags", "+faststart"],
-                },
-            })
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
 
-            if not os.path.exists(mp4):
-                files = [f for f in os.listdir(TMP_DIR) if f.startswith(sid) and f.endswith(".mp4")]
-                if files:
-                    mp4 = os.path.join(TMP_DIR, files[0])
-            if not os.path.exists(mp4):
-                return jsonify({"status": "error",
-                                 "error": "Merged MP4 not produced"}), 500
+        client_sets = CLIENT_CHAIN
+        last_error  = None
+        info        = None
+        for clients in client_sets:
+            try:
+                opts = base_opts(download=True, player_clients=clients)
+                opts.update({
+                    "format":             video_format_string(target_h),
+                    "outtmpl":            tpl,
+                    "merge_output_format": "mp4",
+                    # Re-encode audio to AAC so the output MP4 plays on every
+                    # device (YouTube often serves eac3/opus in the source).
+                    "postprocessor_args": {
+                        "default": [
+                            "-movflags", "+faststart",
+                            "-c:v", "copy",
+                            "-c:a", "aac", "-b:a", "192k",
+                        ],
+                    },
+                })
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
 
-            actual_h = target_h
-            for f in info.get("formats", []) or []:
-                if f.get("format_id") and (f.get("height") or 0) <= target_h and f.get("height"):
-                    actual_h = f["height"]
-            return serve_and_clean(
-                mp4,
-                f"{safe_title(info, 'video')}_{actual_h}p.mp4",
-                "video/mp4",
-            )
-        except Exception as ex:
+                if not os.path.exists(mp4):
+                    files = [f for f in os.listdir(TMP_DIR)
+                             if f.startswith(sid) and f.endswith(".mp4")]
+                    if files:
+                        mp4 = os.path.join(TMP_DIR, files[0])
+                if os.path.exists(mp4):
+                    break
+                last_error = RuntimeError("Merged MP4 not produced")
+            except Exception as ex:
+                last_error = ex
+                cleanup_prefix(sid)
+                log.warning("video attempt clients=%s failed: %s", clients, ex)
+                continue
+
+        if not os.path.exists(mp4):
             cleanup_prefix(sid)
-            log.exception("video_download failed")
-            return jsonify({"status": "error", "error": str(ex)}), 500
+            return jsonify({
+                "status": "error",
+                "error":  str(last_error) if last_error else "video failed",
+            }), 500
+
+        # Detect actual height for filename.  We pick the highest video
+        # stream that is <= target_h, falling back to the lowest available.
+        actual_h = None
+        if info:
+            for f in info.get("formats", []) or []:
+                h = f.get("height") or 0
+                vc = f.get("vcodec") or "none"
+                if h and vc not in (None, "none") and h <= target_h:
+                    if actual_h is None or h > actual_h:
+                        actual_h = h
+        if actual_h is None:
+            actual_h = target_h
+
+        return serve_and_clean(
+            mp4,
+            f"{safe_title(info or {}, 'video')}_{actual_h}p.mp4",
+            "video/mp4",
+        )
 
     # ── INFO MODE ──────────────────────────────────────
     try:

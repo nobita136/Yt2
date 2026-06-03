@@ -1,2 +1,8 @@
 [phases.setup]
 aptPkgs = ["nodejs", "ffmpeg"]
+
+[phases.build]
+cmds = ["pip install --upgrade pip", "pip install -r requirements.txt"]
+
+[start]
+cmd = "gunicorn app:app --bind 0.0.0.0:$PORT --timeout 600 --workers 1 --threads 4 --keep-alive 30"
