@@ -74,12 +74,16 @@ QUALITY_LABELS = {
 
 
 def available_heights(info):
-    seen = set()
-    for f in (info.get("formats") or []):
-        h  = f.get("height")
-        vc = f.get("vcodec") or "none"
-        if h and vc not in (None, "none"):
-            seen.add(h)
+    # Prefer the pre-computed list from page scrape
+    if "heights" in info and info["heights"]:
+        seen = set(info["heights"])
+    else:
+        seen = set()
+        for f in (info.get("formats") or []):
+            h  = f.get("height")
+            vc = f.get("vcodec") or "none"
+            if h and vc not in (None, "none"):
+                seen.add(h)
     out = []
     for t in TARGET_HEIGHTS:
         if any(abs(h - t) <= 10 for h in seen):

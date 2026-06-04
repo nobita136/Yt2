@@ -304,14 +304,179 @@ def _ytdlp_audio(url, out_path, cookies_file):
 
 # ── PUBLIC API ───────────────────────────────────────────────
 
+def _extract_video_id(url):
+    """Pull the 11-char video id from any common YT URL form."""
+    m = re.search(r"(?:v=|/shorts/|/embed/|youtu\.be/)([A-Za-z0-9_-]{11})", url or "")
+    return m.group(1) if m else None
+
+
+def _scrape_info(url, cookies_file=None):
+    """Fetch the YouTube watch page directly (no InnerTube, no bot check)."""
+    vid = _extract_video_id(url)
+    if not vid:
+        raise RuntimeError("Could not parse YouTube video ID from URL")
+    watch_url = f"https://www.youtube.com/watch?v={vid}"
+    headers = {
+        "User-Agent":      DEFAULT_UA,
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    cookies = None
+    if cookies_file and os.path.exists(cookies_file):
+        try:
+            cookies = {}
+            with open(cookies_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("#") or not line.strip():
+                        continue
+                    parts = line.strip().split("\t")
+                    if len(parts) >= 7:
+                        cookies[parts[5]] = parts[6]
+        except Exception as e:
+            log.debug("cookie parse failed: %s", e)
+
+    r = requests.get(watch_url, headers=headers, cookies=cookies, timeout=15)
+    r.raise_for_status()
+    html = r.text
+
+    def find(rx, default=""):
+        m = re.search(rx, html)
+        return m.group(1) if m else default
+
+    # JSON string capture group: matches (\\.|[^"\\])* — handles \" and \\ escapes
+    J = r'((?:\\.|[^"\\])*)'
+
+    title = (find(r'"title":\{"runs":\[\{"text":"' + J + '"')
+             or find(r'"title":\{"simpleText":"' + J + '"')
+             or find(r'"title":"' + J + '","lengthSeconds"')
+             or find(r'<meta name="title" content="([^"]+)"')
+             or "video")
+    # Unescape JSON string: \" → ", \\ → \, \u0026 → &
+    if title:
+        try:
+            title = json.loads('"' + title + '"')
+        except Exception:
+            title = title.replace('\\"', '"').replace("\\\\", "\\")
+        title = (title.replace("&quot;", '"').replace("&amp;", "&")
+                     .replace("&#39;", "'").replace("&lt;", "<")
+                     .replace("&gt;", ">").strip())
+
+    length = find(r'"lengthSeconds":"(\d+)"')
+
+    channel = (find(r'"ownerChannelName":"([^"]+)"')
+               or find(r'<meta itemprop="author" content="([^"]+)"')
+               or find(r'"author":"([^"]+)"'))
+
+    channel_id = find(r'"externalChannelId":"([^"]+)"')
+    channel_url = (f"https://www.youtube.com/channel/{channel_id}"
+                   if channel_id else "")
+
+    thumb = (find(r'"thumbnail":\{"thumbnails":\[\{"url":"([^"]+)"')
+             or find(r'<meta property="og:image" content="([^"]+)"')
+             or f"https://i.ytimg.com/vi/{vid}/maxresdefault.jpg")
+
+    description = find(r'"shortDescription":"((?:[^"\\]|\\.)*)"')
+    if description and "\\u0026" in description:
+        description = description.encode().decode("unicode_escape", errors="ignore")
+
+    views = find(r'"viewCount":"(\d+)"')
+    likes = find(r'"likeCount":"(\d+)"')
+
+    # All video stream heights → only sane ones (≥ 144, ≤ 4320)
+    raw_heights = re.findall(r'"height":(\d+)', html)
+    seen, heights = set(), []
+    for h in raw_heights:
+        try:
+            hv = int(h)
+        except ValueError:
+            continue
+        if 144 <= hv <= 4320 and hv not in seen:
+            seen.add(hv)
+            heights.append(hv)
+    heights.sort()
+
+    # Try to grab a few common adaptive formats (info only, not used for download)
+    formats = []
+    for m in re.finditer(
+        r'"url":"(https://[^"]+googlevideo\.com[^"]+)",'          # url
+        r'.*?"qualityLabel":"([^"]+)",'                            # quality
+        r'.*?"height":(\d+),'                                      # height
+        r'.*?"width":(\d+),'                                       # width
+        r'.*?"mimeType":"([^"]+)"',                                # mime
+        html,
+    ):
+        formats.append({
+            "url":     m.group(1),
+            "format":  m.group(2),
+            "height":  int(m.group(3)),
+            "width":   int(m.group(4)),
+            "ext":     m.group(5).split(";")[0].split("/")[-1],
+        })
+
+    return {
+        "id":         vid,
+        "title":      title,
+        "uploader":   channel,
+        "channel":    channel,
+        "channel_id": channel_id,
+        "channel_url": channel_url,
+        "duration":   int(length) if length else None,
+        "thumbnail":  thumb,
+        "description": description,
+        "view_count": int(views) if views else None,
+        "like_count": int(likes) if likes else None,
+        "heights":    heights,
+        "formats":    formats,
+        "webpage_url": watch_url,
+    }
+
+
 def get_info(url, cookies_file=None):
-    """Video metadata via yt-dlp (works with cookies)."""
+    """Video metadata — page scrape first, oEmbed, yt-dlp last."""
+    # 1. Direct page scrape (works on cloud IPs, no bot check)
+    try:
+        return _scrape_info(url, cookies_file=cookies_file)
+    except Exception as e:
+        log.warning("page scrape failed: %s — trying oEmbed", e)
+
+    # 2. oEmbed (public, no auth) — gives title/thumb/channel
+    try:
+        vid = _extract_video_id(url)
+        if vid:
+            r = requests.get(
+                "https://www.youtube.com/oembed",
+                params={"url": f"https://www.youtube.com/watch?v={vid}",
+                        "format": "json"},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                d = r.json()
+                return {
+                    "id":         vid,
+                    "title":      d.get("title"),
+                    "uploader":   d.get("author_name"),
+                    "channel":    d.get("author_name"),
+                    "thumbnail":  d.get("thumbnail_url"),
+                    "webpage_url": f"https://www.youtube.com/watch?v={vid}",
+                    "heights":    [2160, 1440, 1080, 720, 480, 360, 240, 144],
+                    "formats":    [],
+                    "duration":   None,
+                }
+    except Exception as e:
+        log.warning("oembed failed: %s", e)
+
+    # 3. yt-dlp (last resort, may be bot-blocked on cloud IPs)
     last_err = None
     for clients in CLIENT_CHAIN:
         try:
             opts = _base_opts(cookies_file=cookies_file, players=clients)
             with yt_dlp.YoutubeDL(opts) as ydl:
-                return ydl.extract_info(url, download=False)
+                info = ydl.extract_info(url, download=False)
+                # yt-dlp format → our shape
+                info["heights"] = sorted({
+                    f.get("height") for f in (info.get("formats") or [])
+                    if f.get("height") and f.get("vcodec") not in (None, "none")
+                })
+                return info
         except Exception as e:
             last_err = e
             log.warning("info clients=%s failed: %s", clients, e)
