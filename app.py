@@ -1,12 +1,11 @@
 import os
 import re
-import uuid
-import shutil
 import logging
 import threading
-import yt_dlp
+import shutil
 from flask import Flask, request, jsonify, render_template, send_file, after_this_request
 from flask_cors import CORS
+import cobalt_client as dl
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,126 +18,13 @@ CORS(app)
 
 # ── PATHS ────────────────────────────────────────────────────
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
-TMP_DIR     = "/tmp/ytdl"
 COOKIE_FILE = os.path.join(BASE_DIR, "cookies.txt")
-os.makedirs(TMP_DIR, exist_ok=True)
-
-
-def _which(names):
-    for n in names:
-        if not n:
-            continue
-        if os.path.isabs(n) and os.path.exists(n):
-            return n
-        hit = shutil.which(n)
-        if hit:
-            return hit
-    return None
-
-
-FFMPEG = _which([
-    os.environ.get("FFMPEG_LOCATION"),
-    os.environ.get("FFMPEG_PATH"),
-    "/nix/store/b11ycf80cxi2iyrga8rkq1wzdinmax18-replit-runtime-path/bin/ffmpeg",
-    "/usr/bin/ffmpeg",
-    "/usr/local/bin/ffmpeg",
-    "ffmpeg",
-]) or "ffmpeg"
-
-NODE = _which([
-    os.environ.get("NODE_BINARY"),
-    "/nix/store/1lagpgadaybvs1n2312gysg2phjk89y8-nodejs-20.20.0-wrapped/bin/node",
-    "/usr/bin/node",
-    "/usr/local/bin/node",
-    "/usr/local/bin/nodejs",
-    "node",
-    "nodejs",
-])
-
 HAS_COOKIES = os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 0
 
-
-def _build_cookie_header():
-    """Read cookies.txt → 'name=value; name=value' string for Cookie header."""
-    if not HAS_COOKIES:
-        return ""
-    pairs = []
-    try:
-        with open(COOKIE_FILE, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split("\t")
-                if len(parts) >= 7:
-                    pairs.append(f"{parts[5]}={parts[6]}")
-    except Exception:
-        pass
-    return "; ".join(pairs)
-
-
-_COOKIE_HDR = _build_cookie_header()
-
-log.info("ffmpeg  = %s", FFMPEG)
-log.info("node    = %s", NODE)
-log.info("cookies = %s (%d bytes, header_len=%d)",
-         COOKIE_FILE,
-         os.path.getsize(COOKIE_FILE) if HAS_COOKIES else 0,
-         len(_COOKIE_HDR))
-
-# Player-client list.  yt-dlp defaults to a set that includes the "tv"
-# client which exposes the full height table (144/240/360/480/720/1080/...)
-# but only as separate video+audio streams.  "web" returns a few progressive
-# MP4 streams.  We try the most-capable clients first and fall back through
-# the rest.  "default" tells yt-dlp to use its built-in priority, which is
-# usually what works on Replit/Replit-like IPs.
-CLIENT_CHAIN = [
-    None,                # yt-dlp default (best on Replit)
-    ["tv"],              # TV HTML5 – full set, but no progressive MP4
-    ["web", "mweb"],     # WEB clients – progressive MP4
-    ["ios"],             # iOS – limited
-    ["android"],         # ANDROID – limited
-]
-
-
-# ── YT-DLP BASE OPTIONS ──────────────────────────────────────
-def base_opts(download=False, player_clients=None):
-    hdrs = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    if _COOKIE_HDR:
-        hdrs["Cookie"] = _COOKIE_HDR
-
-    opts = {
-        "quiet":            True,
-        "no_warnings":      True,
-        "ignoreerrors":     False,
-        "retries":          5,
-        "fragment_retries": 5,
-        "socket_timeout":   30,
-        "noplaylist":       True,
-        "skip_download":    not download,
-        "ffmpeg_location":  FFMPEG,
-        "merge_output_format": "mp4",
-        "http_headers":     hdrs,
-    }
-    if player_clients:
-        opts["extractor_args"] = {"youtube": {"player_client": player_clients}}
-    # js_runtimes lets yt-dlp solve the n-challenge (prevents format-not-available)
-    if NODE:
-        opts["js_runtimes"] = {"node": {"path": NODE}}
-    # remote_components must be a set/list, not a dict
-    opts["remote_components"] = {"ejs:github"}
-    # Always pass cookiefile too — belt-and-suspenders with the Cookie header
-    if HAS_COOKIES:
-        opts["cookiefile"] = COOKIE_FILE
-    return opts
-
+log.info("cookies  = %s (%d bytes)", COOKIE_FILE,
+         os.path.getsize(COOKIE_FILE) if HAS_COOKIES else 0)
+log.info("cobalt   = %d instances", len(dl.COBALT_INSTANCES))
+log.info("yt-dlp   = v%s", dl.yt_dlp.version.__version__)
 
 # ── HELPERS ──────────────────────────────────────────────────
 URL_RE = re.compile(r"^https?://", re.I)
@@ -157,22 +43,6 @@ def normalize_url(link):
     return link
 
 
-def extract_info(url):
-    """Extract video info.  Tries several player client sets so the request
-    succeeds whether the server is on a Replit IP, a Render IP, with or
-    without cookies."""
-    last = None
-    for clients in CLIENT_CHAIN:
-        try:
-            opts = base_opts(player_clients=clients)
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                return ydl.extract_info(url, download=False)
-        except Exception as e:
-            last = e
-            log.warning("extract_info with clients=%s failed: %s", clients, e)
-    raise last or RuntimeError("extract_info failed for all player clients")
-
-
 def format_duration(sec):
     if not sec:
         return "N/A"
@@ -181,36 +51,21 @@ def format_duration(sec):
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
-def safe_title(info, fallback="file"):
-    t = (info.get("title") or fallback) if isinstance(info, dict) else fallback
-    cleaned = "".join(c for c in t if c.isalnum() or c in " _-").strip()
-    return cleaned[:80] or fallback
-
-
 def serve_and_clean(path, name, mime):
-    def _del(p):
-        try: os.remove(p)
-        except OSError: pass
+    """Send the file, then delete its parent temp dir."""
+    parent = os.path.dirname(os.path.abspath(path))
+
+    def _cleanup(_p=parent):
+        shutil.rmtree(_p, ignore_errors=True)
 
     @after_this_request
     def _after(resp):
-        threading.Thread(target=_del, args=(path,), daemon=True).start()
+        threading.Thread(target=_cleanup, daemon=True).start()
         return resp
 
     return send_file(path, as_attachment=True, download_name=name, mimetype=mime)
 
 
-def cleanup_prefix(prefix):
-    try:
-        for f in os.listdir(TMP_DIR):
-            if f.startswith(prefix):
-                try: os.remove(os.path.join(TMP_DIR, f))
-                except OSError: pass
-    except OSError:
-        pass
-
-
-# Heights the user asked for (and higher) – mp4-only
 TARGET_HEIGHTS = [2160, 1440, 1080, 720, 480, 360, 240, 144]
 QUALITY_LABELS = {
     2160: "4K UHD", 1440: "2K QHD", 1080: "Full HD",
@@ -219,18 +74,11 @@ QUALITY_LABELS = {
 
 
 def available_heights(info):
-    """Heights that exist as video streams (any modern codec).  We use the
-    presence of a video stream as a hint that we can produce a merged MP4 at
-    that height, even if the original stream is webm/av1 – ffmpeg will
-    transcode / remux as needed."""
     seen = set()
-    for f in info.get("formats", []) or []:
-        h    = f.get("height")
-        vc   = f.get("vcodec") or "none"
-        ac   = f.get("acodec") or "none"
+    for f in (info.get("formats") or []):
+        h  = f.get("height")
+        vc = f.get("vcodec") or "none"
         if h and vc not in (None, "none"):
-            # Any video stream (progressive OR video-only) means the height
-            # is achievable.  ffmpeg will merge with audio automatically.
             seen.add(h)
     out = []
     for t in TARGET_HEIGHTS:
@@ -239,24 +87,16 @@ def available_heights(info):
     return out
 
 
-def video_format_string(target_h):
-    """Format selector that always succeeds and always ends up merged to MP4.
-
-    Order of preference:
-      1. H.264 MP4 video + M4A audio (broad player support)
-      2. Any MP4 video + M4A audio
-      3. Any video + any audio   → ffmpeg merges to MP4
-      4. Single progressive MP4
-      5. Anything → ffmpeg remuxes to MP4
-    """
-    return (
-        f"bestvideo[height<={target_h}][ext=mp4][vcodec^=avc]+bestaudio[ext=m4a]"
-        f"/bestvideo[height<={target_h}][ext=mp4]+bestaudio[ext=m4a]"
-        f"/bestvideo[height<={target_h}]+bestaudio"
-        f"/best[height<={target_h}][ext=mp4]"
-        f"/best[height<={target_h}]"
-        f"/best"
-    )
+def actual_height(info, target_h):
+    """Highest video stream height <= target_h (for filename)."""
+    best = None
+    for f in (info.get("formats") or []):
+        h  = f.get("height") or 0
+        vc = f.get("vcodec") or "none"
+        if h and vc not in (None, "none") and h <= target_h:
+            if best is None or h > best:
+                best = h
+    return best or target_h
 
 
 # ══════════════════════════════════════════════════════
@@ -271,13 +111,11 @@ def index():
 @app.route("/health")
 def health():
     return jsonify({
-        "status":      "ok",
-        "ffmpeg":      FFMPEG,
-        "ffmpeg_ok":   os.path.exists(FFMPEG) if os.path.isabs(FFMPEG) else True,
-        "node":        NODE,
-        "node_ok":     bool(NODE),
-        "cookies":     HAS_COOKIES,
-        "yt_dlp":      yt_dlp.version.__version__,
+        "status":           "ok",
+        "cookies":          HAS_COOKIES,
+        "yt_dlp":           dl.yt_dlp.version.__version__,
+        "cobalt_instances": len(dl.COBALT_INSTANCES),
+        "ffmpeg":           dl.ffmpeg_path(),
     })
 
 
@@ -289,10 +127,16 @@ def search():
     if not q:
         return jsonify({"error": "Query is required"}), 400
     try:
-        opts = base_opts()
-        opts["extract_flat"] = True
-        opts["playlistend"]  = limit
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        opts = {
+            "quiet": True, "no_warnings": True, "ignoreerrors": False,
+            "noplaylist": True, "skip_download": True,
+            "extract_flat": True, "playlistend": limit,
+            "http_headers": {"User-Agent": dl.DEFAULT_UA,
+                             "Accept-Language": "en-US,en;q=0.9"},
+        }
+        if HAS_COOKIES:
+            opts["cookiefile"] = COOKIE_FILE
+        with dl.yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(f"ytsearch{limit}:{q}", download=False)
         videos = []
         for e in (info.get("entries") or []):
@@ -324,71 +168,43 @@ def audio_info(link=None):
     if not raw:
         return jsonify({"status": "error", "error": "url required"}), 400
     try:
-        info = extract_info(normalize_url(raw))
+        info = dl.get_info(normalize_url(raw),
+                           cookies_file=COOKIE_FILE if HAS_COOKIES else None)
         return jsonify({
             "status":    "ok",
             "title":     info.get("title"),
             "thumbnail": info.get("thumbnail"),
             "duration":  format_duration(info.get("duration")),
-            "channel":   info.get("uploader"),
+            "channel":   info.get("uploader") or info.get("channel"),
         })
     except Exception as ex:
         return jsonify({"status": "error", "error": str(ex)}), 500
 
 
-# ── AUDIO DOWNLOAD (MP3, low quality) ───────────────────
+# ── AUDIO DOWNLOAD (MP3, 64 kbps) ────────────────────────
 @app.route("/dl/audio")
 def audio_download():
     raw = (request.args.get("url") or "").strip()
     if not raw:
         return jsonify({"status": "error", "error": "url required"}), 400
     url = normalize_url(raw)
-    sid = uuid.uuid4().hex
-    tpl = os.path.join(TMP_DIR, f"{sid}.%(ext)s")
-    mp3 = os.path.join(TMP_DIR, f"{sid}.mp3")
-
-    client_sets = CLIENT_CHAIN
-    last_error  = None
-    for clients in client_sets:
+    try:
+        path, name, mime = dl.download_audio(
+            url, cookies_file=COOKIE_FILE if HAS_COOKIES else None
+        )
         try:
-            opts = base_opts(download=True, player_clients=clients)
-            opts.update({
-                # Lowest-bitrate audio-only stream → tiny MP3
-                "format":          "worstaudio/worst",
-                "outtmpl":         tpl,
-                "postprocessors":  [{
-                    "key":              "FFmpegExtractAudio",
-                    "preferredcodec":   "mp3",
-                    "preferredquality": "64",   # 64 kbps – "low quality"
-                }],
-                "postprocessor_args": ["-vn"],
-            })
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-
-            if not os.path.exists(mp3):
-                files = [f for f in os.listdir(TMP_DIR)
-                         if f.startswith(sid) and f.endswith(".mp3")]
-                if files:
-                    mp3 = os.path.join(TMP_DIR, files[0])
-            if os.path.exists(mp3):
-                return serve_and_clean(mp3,
-                                        f"{safe_title(info, 'audio')}.mp3",
-                                        "audio/mpeg")
-            last_error = RuntimeError("MP3 file not produced")
-        except Exception as ex:
-            last_error = ex
-            cleanup_prefix(sid)
-            log.warning("audio attempt clients=%s failed: %s", clients, ex)
-            continue
-
-    cleanup_prefix(sid)
-    log.exception("audio_download failed")
-    return jsonify({"status": "error",
-                    "error": str(last_error) if last_error else "audio failed"}), 500
+            info = dl.get_info(url, cookies_file=COOKIE_FILE if HAS_COOKIES else None)
+            title = info.get("title") or "audio"
+        except Exception:
+            title = "audio"
+        final_name = f"{dl.safe_filename(title, 'audio')}.mp3"
+        return serve_and_clean(path, final_name, "audio/mpeg")
+    except Exception as ex:
+        log.exception("audio_download failed")
+        return jsonify({"status": "error", "error": str(ex)}), 500
 
 
-# ── VIDEO INFO (JSON, lists available MP4 qualities) ───
+# ── VIDEO INFO + DOWNLOAD ───────────────────────────────
 @app.route("/download/video")
 @app.route("/download/video/<path:link>")
 def video(link=None):
@@ -407,74 +223,36 @@ def video(link=None):
         else:
             target_h = 1080
 
-        sid = uuid.uuid4().hex
-        tpl = os.path.join(TMP_DIR, f"{sid}.%(ext)s")
-        mp4 = os.path.join(TMP_DIR, f"{sid}.mp4")
+        # Try to detect actual height + title for filename
+        try:
+            info  = dl.get_info(url, cookies_file=COOKIE_FILE if HAS_COOKIES else None)
+            h     = actual_height(info, target_h)
+            title = info.get("title") or "video"
+        except Exception:
+            h, title = target_h, "video"
 
-        client_sets = CLIENT_CHAIN
-        last_error  = None
-        info        = None
-        for clients in client_sets:
-            try:
-                opts = base_opts(download=True, player_clients=clients)
-                opts.update({
-                    "format":              video_format_string(target_h),
-                    "outtmpl":             tpl,
-                    "merge_output_format": "mp4",
-                })
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-
-                if not os.path.exists(mp4):
-                    files = [f for f in os.listdir(TMP_DIR)
-                             if f.startswith(sid) and f.endswith(".mp4")]
-                    if files:
-                        mp4 = os.path.join(TMP_DIR, files[0])
-                if os.path.exists(mp4):
-                    break
-                last_error = RuntimeError("Merged MP4 not produced")
-            except Exception as ex:
-                last_error = ex
-                cleanup_prefix(sid)
-                log.warning("video attempt clients=%s failed: %s", clients, ex)
-                continue
-
-        if not os.path.exists(mp4):
-            cleanup_prefix(sid)
-            return jsonify({
-                "status": "error",
-                "error":  str(last_error) if last_error else "video failed",
-            }), 500
-
-        # Detect actual height for filename.  We pick the highest video
-        # stream that is <= target_h, falling back to the lowest available.
-        actual_h = None
-        if info:
-            for f in info.get("formats", []) or []:
-                h = f.get("height") or 0
-                vc = f.get("vcodec") or "none"
-                if h and vc not in (None, "none") and h <= target_h:
-                    if actual_h is None or h > actual_h:
-                        actual_h = h
-        if actual_h is None:
-            actual_h = target_h
-
-        return serve_and_clean(
-            mp4,
-            f"{safe_title(info or {}, 'video')}_{actual_h}p.mp4",
-            "video/mp4",
-        )
+        try:
+            path, name, mime = dl.download_video(
+                url, height=target_h,
+                cookies_file=COOKIE_FILE if HAS_COOKIES else None,
+            )
+            ext = os.path.splitext(name)[1] or ".mp4"
+            final_name = f"{dl.safe_filename(title, 'video')}_{h}p{ext}"
+            return serve_and_clean(path, final_name, mime)
+        except Exception as ex:
+            log.exception("video_download failed")
+            return jsonify({"status": "error", "error": str(ex)}), 500
 
     # ── INFO MODE ──────────────────────────────────────
     try:
-        info    = extract_info(url)
+        info    = dl.get_info(url, cookies_file=COOKIE_FILE if HAS_COOKIES else None)
         heights = available_heights(info)
         return jsonify({
             "status":    "ok",
             "title":     info.get("title"),
             "thumbnail": info.get("thumbnail"),
             "duration":  format_duration(info.get("duration")),
-            "channel":   info.get("uploader"),
+            "channel":   info.get("uploader") or info.get("channel"),
             "qualities": [
                 {"height": h, "label": QUALITY_LABELS.get(h, f"{h}p")}
                 for h in heights

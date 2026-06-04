@@ -2,3 +2,4 @@ flask>=3.0
 flask-cors>=4.0
 yt-dlp>=2026.3.17
 gunicorn>=21.0
+requests>=2.31
