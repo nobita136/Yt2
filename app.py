@@ -50,15 +50,41 @@ NODE = _which([
     "/nix/store/1lagpgadaybvs1n2312gysg2phjk89y8-nodejs-20.20.0-wrapped/bin/node",
     "/usr/bin/node",
     "/usr/local/bin/node",
+    "/usr/local/bin/nodejs",
     "node",
     "nodejs",
 ])
 
 HAS_COOKIES = os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 0
 
-log.info("ffmpeg = %s", FFMPEG)
-log.info("node   = %s", NODE)
-log.info("cookies= %s (%d bytes)", COOKIE_FILE, os.path.getsize(COOKIE_FILE) if HAS_COOKIES else 0)
+
+def _build_cookie_header():
+    """Read cookies.txt → 'name=value; name=value' string for Cookie header."""
+    if not HAS_COOKIES:
+        return ""
+    pairs = []
+    try:
+        with open(COOKIE_FILE, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 7:
+                    pairs.append(f"{parts[5]}={parts[6]}")
+    except Exception:
+        pass
+    return "; ".join(pairs)
+
+
+_COOKIE_HDR = _build_cookie_header()
+
+log.info("ffmpeg  = %s", FFMPEG)
+log.info("node    = %s", NODE)
+log.info("cookies = %s (%d bytes, header_len=%d)",
+         COOKIE_FILE,
+         os.path.getsize(COOKIE_FILE) if HAS_COOKIES else 0,
+         len(_COOKIE_HDR))
 
 # Player-client list.  yt-dlp defaults to a set that includes the "tv"
 # client which exposes the full height table (144/240/360/480/720/1080/...)
@@ -77,6 +103,17 @@ CLIENT_CHAIN = [
 
 # ── YT-DLP BASE OPTIONS ──────────────────────────────────────
 def base_opts(download=False, player_clients=None):
+    hdrs = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    if _COOKIE_HDR:
+        hdrs["Cookie"] = _COOKIE_HDR
+
     opts = {
         "quiet":            True,
         "no_warnings":      True,
@@ -84,29 +121,20 @@ def base_opts(download=False, player_clients=None):
         "retries":          5,
         "fragment_retries": 5,
         "socket_timeout":   30,
-        "concurrent_fragment_downloads": 4,
         "noplaylist":       True,
         "skip_download":    not download,
         "ffmpeg_location":  FFMPEG,
-        # Always merge any video+audio pair into an MP4 container.
         "merge_output_format": "mp4",
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-            "Sec-Fetch-Dest":  "document",
-            "Sec-Fetch-Mode":  "navigate",
-            "Sec-Fetch-Site":  "none",
-        },
+        "http_headers":     hdrs,
     }
     if player_clients:
         opts["extractor_args"] = {"youtube": {"player_client": player_clients}}
+    # js_runtimes lets yt-dlp solve the n-challenge (prevents format-not-available)
     if NODE:
         opts["js_runtimes"] = {"node": {"path": NODE}}
-        opts["remote_components"] = {"ejs": True}
+    # remote_components must be a set/list, not a dict
+    opts["remote_components"] = {"ejs:github"}
+    # Always pass cookiefile too — belt-and-suspenders with the Cookie header
     if HAS_COOKIES:
         opts["cookiefile"] = COOKIE_FILE
     return opts
@@ -390,18 +418,9 @@ def video(link=None):
             try:
                 opts = base_opts(download=True, player_clients=clients)
                 opts.update({
-                    "format":             video_format_string(target_h),
-                    "outtmpl":            tpl,
+                    "format":              video_format_string(target_h),
+                    "outtmpl":             tpl,
                     "merge_output_format": "mp4",
-                    # Re-encode audio to AAC so the output MP4 plays on every
-                    # device (YouTube often serves eac3/opus in the source).
-                    "postprocessor_args": {
-                        "default": [
-                            "-movflags", "+faststart",
-                            "-c:v", "copy",
-                            "-c:a", "aac", "-b:a", "192k",
-                        ],
-                    },
                 })
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(url, download=True)
